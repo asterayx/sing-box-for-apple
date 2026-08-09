@@ -122,11 +122,7 @@ public final class NewProfileViewModel: BaseViewModel {
                 } else {
                     configContent = "{}"
                 }
-                var error: NSError?
-                LibboxCheckConfig(configContent, &error)
-                if let error {
-                    throw error
-                }
+                try ConfigurationValidator.check(configContent)
                 try FileManager.default.createDirectory(at: profileConfigDirectory, withIntermediateDirectories: true)
                 try configContent.write(to: profileConfig, atomically: true, encoding: .utf8)
             }
@@ -148,11 +144,7 @@ public final class NewProfileViewModel: BaseViewModel {
         } else if profileType == .remote {
             let remoteContent = try await HTTPClient.getStringAsync(remotePath)
             try await BlockingIO.run {
-                var error: NSError?
-                LibboxCheckConfig(remoteContent, &error)
-                if let error {
-                    throw error
-                }
+                try ConfigurationValidator.check(remoteContent)
             }
             let profileConfigDirectory = FilePath.sharedDirectory.appendingPathComponent("configs", isDirectory: true)
             let profileConfig = profileConfigDirectory.appendingPathComponent("config_\(nextProfileID).json")

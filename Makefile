@@ -6,6 +6,20 @@ INSTALLER_SIGN_IDENTITY := 16480CA444F481F8DEAF9421FAD2CCE590FC54E4
 XCODEBUILD_FLAGS ?= -skipPackagePluginValidation
 export DISABLE_SWIFTLINT := 1
 
+EXPECTED_CORE_TAG ?= v1.14.0-beta.10
+SING_BOX_SOURCE ?= ../sing-box
+GO_BIN_PATH ?= $(shell go env GOPATH)/bin
+CORE_PROTOCOL_PATCH := $(CURDIR)/Patches/sing-box-without-vmess-vless.patch
+IOS_DEVELOPMENT_ARCHIVE_PATH ?= build/SFI-development.xcarchive
+IOS_DEVELOPMENT_EXPORT_PATH ?= build/SFI-development
+TEAM_ID ?= EL6G8M5A96
+BUNDLE_ID ?= com.asterayx.sfi.dev
+ALLOW_PROVISIONING_UPDATES ?= 0
+
+ifeq ($(ALLOW_PROVISIONING_UPDATES),1)
+IOS_PROVISIONING_FLAGS := -allowProvisioningUpdates -allowProvisioningDeviceRegistration
+endif
+
 build_all: build_ios build_macos build_tvos
 
 build_ios_deb:
@@ -13,6 +27,50 @@ build_ios_deb:
 
 build_ios:
 	xcodebuild build $(XCODEBUILD_FLAGS) -scheme SFI -configuration Debug -destination 'generic/platform=iOS' | xcbeautify | grep -A 10 -e "Build Succeeded" -e "BUILD FAILED" -e "❌"
+
+check_ios_core:
+	test -e "$(SING_BOX_SOURCE)/.git"
+	test "$$(git -C "$(SING_BOX_SOURCE)" describe --tags --exact-match 2>/dev/null)" = "$(EXPECTED_CORE_TAG)"
+	test -x "$(GO_BIN_PATH)/gomobile"
+	test -x "$(GO_BIN_PATH)/gobind"
+	git -C "$(SING_BOX_SOURCE)" apply --check --reverse "$(CORE_PROTOCOL_PATCH)"
+
+apply_ios_core_protocol_patch:
+	test -e "$(SING_BOX_SOURCE)/.git"
+	test "$$(git -C "$(SING_BOX_SOURCE)" describe --tags --exact-match 2>/dev/null)" = "$(EXPECTED_CORE_TAG)"
+	if ! git -C "$(SING_BOX_SOURCE)" apply --check --reverse "$(CORE_PROTOCOL_PATCH)" >/dev/null 2>&1; then \
+		git -C "$(SING_BOX_SOURCE)" apply --check "$(CORE_PROTOCOL_PATCH)"; \
+		git -C "$(SING_BOX_SOURCE)" apply "$(CORE_PROTOCOL_PATCH)"; \
+	fi
+
+test_ios_core_protocol_patch: check_ios_core
+	cd "$(SING_BOX_SOURCE)" && go test -tags "without_vmess_vless without_openvpn_openconnect_naive" ./include
+	cd "$(SING_BOX_SOURCE)" && go test -tags "with_low_memory with_quic without_vmess_vless without_openvpn_openconnect_naive" ./protocol/tuic
+	cd "$(SING_BOX_SOURCE)" && ! go list -deps -tags "without_vmess_vless without_openvpn_openconnect_naive with_quic" ./experimental/libbox | grep -E '/protocol/(vmess|vless|openvpn|openconnect|naive)$$'
+
+build_libbox_ios: check_ios_core
+	cd "$(SING_BOX_SOURCE)" && PATH="$(GO_BIN_PATH):$$PATH" go run ./cmd/internal/build_libbox -target apple -platform ios -without-vmess-vless -without-openvpn-openconnect-naive
+	if test -d "$(SING_BOX_SOURCE)/Libbox.xcframework"; then \
+		rm -rf "$(CURDIR)/Libbox.xcframework"; \
+		mv "$(SING_BOX_SOURCE)/Libbox.xcframework" "$(CURDIR)/Libbox.xcframework"; \
+	fi
+	test -d "$(CURDIR)/Libbox.xcframework"
+
+check_ios_development_signing:
+	test -n "$(TEAM_ID)"
+	test -n "$(BUNDLE_ID)"
+
+archive_ios_development: check_ios_development_signing
+	rm -rf "$(IOS_DEVELOPMENT_ARCHIVE_PATH)"
+	xcodebuild archive $(XCODEBUILD_FLAGS) $(IOS_PROVISIONING_FLAGS) -scheme SFI -configuration Release -destination 'generic/platform=iOS' -archivePath "$(IOS_DEVELOPMENT_ARCHIVE_PATH)" DEVELOPMENT_TEAM="$(TEAM_ID)" BASE_PACKAGE_IDENTIFIER="$(BUNDLE_ID)" | xcbeautify
+
+export_ios_development: check_ios_development_signing
+	rm -rf "$(IOS_DEVELOPMENT_EXPORT_PATH)"
+	xcodebuild -exportArchive $(IOS_PROVISIONING_FLAGS) -archivePath "$(IOS_DEVELOPMENT_ARCHIVE_PATH)" -exportOptionsPlist SFI/Export.plist -exportPath "$(IOS_DEVELOPMENT_EXPORT_PATH)"
+
+package_ios_development: archive_ios_development export_ios_development
+
+package_ios_development_trimmed: build_libbox_ios package_ios_development
 
 build_macos:
 	xcodebuild build $(XCODEBUILD_FLAGS) -scheme SFM -configuration Debug -destination 'generic/platform=macOS' | xcbeautify | grep -A 10 -e "Build Succeeded" -e "BUILD FAILED" -e "❌"

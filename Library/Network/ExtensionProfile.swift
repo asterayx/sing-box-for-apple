@@ -164,13 +164,35 @@ public class ExtensionProfile: ObservableObject {
             return
         }
         guard let manager else { return }
-        try await fetchProfile()
+        do {
+            try await fetchProfile()
+        } catch {
+            throw ExtensionStartupError("prepare selected profile: \(error.localizedDescription)")
+        }
+        let options: [String: NSObject]
+        do {
+            // Validate and stage the runtime configuration before enabling
+            // on-demand recovery. This avoids a reconnect loop when a profile
+            // is invalid.
+            options = try await prepareStartOptions()
+        } catch {
+            throw ExtensionStartupError("prepare start options: \(error.localizedDescription)")
+        }
         manager.isEnabled = true
         let alwaysOn = await SharedPreferences.alwaysOn.get()
         let onDemandEnabled = await SharedPreferences.onDemandEnabled.get()
-        if alwaysOn || onDemandEnabled {
+        #if os(iOS)
+            // A Packet Tunnel killed by jetsam cannot restart itself. Keep an
+            // on-demand connect rule active for the lifetime of a manually
+            // started session so iOS can relaunch it. stop() disables the rule
+            // again when the user intentionally disconnects.
+            let recoverUnexpectedDisconnect = true
+        #else
+            let recoverUnexpectedDisconnect = false
+        #endif
+        if alwaysOn || onDemandEnabled || recoverUnexpectedDisconnect {
             manager.isOnDemandEnabled = true
-            await setOnDemandRules(useDefaultRules: alwaysOn)
+            await setOnDemandRules(useDefaultRules: alwaysOn || (recoverUnexpectedDisconnect && !onDemandEnabled))
         }
         if let proto = manager.protocolConfiguration as? NETunnelProviderProtocol {
             var config = proto.providerConfiguration ?? [:]
@@ -193,9 +215,16 @@ public class ExtensionProfile: ObservableObject {
                 }
             }
         #endif
-        try await manager.saveToPreferences()
-        let options = try await prepareStartOptions()
-        try manager.connection.startVPNTunnel(options: options)
+        do {
+            try await manager.saveToPreferences()
+        } catch {
+            throw ExtensionStartupError("save VPN preferences: \(error.localizedDescription)")
+        }
+        do {
+            try manager.connection.startVPNTunnel(options: options)
+        } catch {
+            throw ExtensionStartupError("request Packet Tunnel start: \(error.localizedDescription)")
+        }
     }
 
     public func reloadService() async throws {
@@ -239,8 +268,52 @@ public class ExtensionProfile: ObservableObject {
             ])
         }
 
-        let configContent = try await profile.readAsync()
-        options["configContent"] = NSString(string: configContent)
+        let configContent: String
+        do {
+            configContent = try await profile.readAsync()
+        } catch {
+            throw ExtensionStartupError("read selected profile: \(error.localizedDescription)")
+        }
+        #if !os(tvOS)
+            let includeAllNetworks = await SharedPreferences.includeAllNetworks.get()
+        #endif
+        #if os(iOS)
+            let runtimeConfigContent: String
+            do {
+                runtimeConfigContent = try LowMemoryConfiguration.prepare(
+                    configContent,
+                    includeAllNetworks: includeAllNetworks,
+                    production: !Variant.inDebug
+                )
+            } catch {
+                throw ExtensionStartupError("prepare low-memory configuration: \(error.localizedDescription)")
+            }
+        #else
+            let runtimeConfigContent = configContent
+        #endif
+        do {
+            try await BlockingIO.run {
+                try ConfigurationValidator.check(runtimeConfigContent)
+            }
+        } catch {
+            throw ExtensionStartupError("validate runtime configuration: \(error.localizedDescription)")
+        }
+        #if os(iOS)
+            do {
+                try await BlockingIO.run {
+                    let configURL = FilePath.sharedDirectory.appendingPathComponent(ExtensionStartOptions.activeConfigFileName)
+                    try runtimeConfigContent.write(to: configURL, atomically: true, encoding: .utf8)
+                }
+            } catch {
+                throw ExtensionStartupError("stage runtime configuration: \(error.localizedDescription)")
+            }
+        #endif
+
+        #if os(iOS)
+            options[ExtensionStartOptions.configPathKey] = NSString(string: ExtensionStartOptions.activeConfigFileName)
+        #else
+            options[ExtensionStartOptions.legacyConfigContentKey] = NSString(string: runtimeConfigContent)
+        #endif
 
         #if os(macOS)
             options["oomKillerEnabled"] = await NSNumber(value: SharedPreferences.oomKillerEnabled.get())
@@ -253,7 +326,7 @@ public class ExtensionProfile: ObservableObject {
         options["excludeAPNsRoute"] = await NSNumber(value: SharedPreferences.excludeAPNsRoute.get())
 
         #if !os(tvOS)
-            options["includeAllNetworks"] = await NSNumber(value: SharedPreferences.includeAllNetworks.get())
+            options["includeAllNetworks"] = NSNumber(value: includeAllNetworks)
         #endif
 
         #if os(tvOS)

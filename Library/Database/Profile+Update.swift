@@ -10,11 +10,7 @@ public extension Profile {
         let url = remoteURL
         let remoteContent = try await HTTPClient.getStringAsync(url)
         try await BlockingIO.run {
-            var error: NSError?
-            LibboxCheckConfig(remoteContent, &error)
-            if let error {
-                throw error
-            }
+            try ConfigurationValidator.check(remoteContent)
         }
         await MainActor.run {
             lastUpdated = Date()

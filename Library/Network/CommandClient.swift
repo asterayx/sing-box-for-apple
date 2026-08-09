@@ -150,7 +150,7 @@ public class CommandClient: ObservableObject {
     private var logBatchTimer: DispatchWorkItem?
     private let logBatchInterval: TimeInterval = 0.1 // 100ms batch window
 
-    public init(_ connectionTypes: [ConnectionType], logMaxLines: Int = 3000, localOnly: Bool = false) {
+    public init(_ connectionTypes: [ConnectionType], logMaxLines: Int = 300, localOnly: Bool = false) {
         self.connectionTypes = connectionTypes
         self.logMaxLines = logMaxLines
         self.localOnly = localOnly

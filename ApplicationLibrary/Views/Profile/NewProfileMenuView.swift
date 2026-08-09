@@ -272,11 +272,7 @@ public struct NewProfileMenuView: View {
                         Task {
                             do {
                                 try await BlockingIO.run {
-                                    var error: NSError?
-                                    LibboxCheckConfig(content.config, &error)
-                                    if let error {
-                                        throw error
-                                    }
+                                    try ConfigurationValidator.check(content.config)
                                 }
                                 try await content.importProfile()
                                 environments.profileUpdate.send()

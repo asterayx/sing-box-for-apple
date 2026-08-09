@@ -6,6 +6,9 @@ Experimental iOS/macOS/tvOS client for sing-box, the universal proxy platform.
 
 [SFI](https://sing-box.sagernet.org/installation/clients/sfi/) | [SFM](https://sing-box.sagernet.org/installation/clients/sfm/)
 
+For local iOS development signing, a trimmed Libbox build without VMess/VLESS,
+and the memory-budget checklist, see [BUILDING_IOS_CN.md](BUILDING_IOS_CN.md).
+
 ## License
 
 ```

@@ -51,9 +51,12 @@ public final class EditProfileContentViewModel: BaseViewModel {
             return
         }
         let errorDescription: String? = await BlockingIO.run {
-            var error: NSError?
-            LibboxCheckConfig(content, &error)
-            return error?.localizedDescription
+            do {
+                try ConfigurationValidator.check(content)
+                return nil
+            } catch {
+                return error.localizedDescription
+            }
         }
         configurationError = errorDescription
     }

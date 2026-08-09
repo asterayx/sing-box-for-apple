@@ -1,0 +1,496 @@
+diff --git a/cmd/internal/build_libbox/main.go b/cmd/internal/build_libbox/main.go
+index 5b2d9e2..bee9452 100644
+--- a/cmd/internal/build_libbox/main.go
++++ b/cmd/internal/build_libbox/main.go
+@@ -17,9 +17,11 @@ import (
+ )
+ 
+ var (
+-	debugEnabled bool
+-	target       string
+-	platform     string
++	debugEnabled                   bool
++	target                         string
++	platform                       string
++	withoutVMessVLESS              bool
++	withoutOpenVPNOpenConnectNaive bool
+ 	// withTailscale bool
+ )
+ 
+@@ -27,6 +29,8 @@ func init() {
+ 	flag.BoolVar(&debugEnabled, "debug", false, "enable debug")
+ 	flag.StringVar(&target, "target", "android", "target platform")
+ 	flag.StringVar(&platform, "platform", "", "specify platform")
++	flag.BoolVar(&withoutVMessVLESS, "without-vmess-vless", false, "exclude VMess and VLESS inbounds and outbounds")
++	flag.BoolVar(&withoutOpenVPNOpenConnectNaive, "without-openvpn-openconnect-naive", false, "exclude OpenVPN, OpenConnect, and Naive")
+ 	// flag.BoolVar(&withTailscale, "with-tailscale", false, "build tailscale for iOS and tvOS")
+ }
+ 
+@@ -219,6 +223,13 @@ func buildApple() {
+ 	}
+ 
+ 	tags := append(sharedTags, darwinTags...)
++	if withoutVMessVLESS {
++		tags = append(tags, "without_vmess_vless")
++	}
++	if withoutOpenVPNOpenConnectNaive {
++		tags = filterTags(tags, "with_openvpn", "with_openconnect", "with_naive_outbound")
++		tags = append(tags, "without_openvpn_openconnect_naive")
++	}
+ 	//if withTailscale {
+ 	//	tags = append(tags, memcTags...)
+ 	//}
+diff --git a/experimental/libbox/setup.go b/experimental/libbox/setup.go
+index 8c27613..9fef370 100644
+--- a/experimental/libbox/setup.go
++++ b/experimental/libbox/setup.go
+@@ -34,6 +34,8 @@ var (
+ 	sOOMKillerEnabled        bool
+ 	sOOMKillerDisabled       bool
+ 	sOOMMemoryLimit          int64
++	sGoMemoryLimit           int64
++	sGoGCPercent             int32
+ )
+ 
+ func init() {
+@@ -54,6 +56,8 @@ type SetupOptions struct {
+ 	OomKillerEnabled        bool
+ 	OomKillerDisabled       bool
+ 	OomMemoryLimit          int64
++	GoMemoryLimit           int64
++	GoGCPercent             int32
+ }
+ 
+ func applySetupOptions(options *SetupOptions) {
+@@ -80,11 +84,18 @@ func ReloadSetupOptions(options *SetupOptions) {
+ 	sOOMKillerEnabled = options.OomKillerEnabled
+ 	sOOMKillerDisabled = options.OomKillerDisabled
+ 	sOOMMemoryLimit = options.OomMemoryLimit
++	sGoMemoryLimit = options.GoMemoryLimit
++	sGoGCPercent = options.GoGCPercent
++	if sGoGCPercent > 0 {
++		debug.SetGCPercent(int(sGoGCPercent))
++	}
+ 	if sOOMKillerEnabled {
+ 		if sOOMMemoryLimit == 0 && C.IsIos {
+ 			sOOMMemoryLimit = oomkiller.DefaultAppleNetworkExtensionMemoryLimit
+ 		}
+-		if sOOMMemoryLimit > 0 {
++		if sGoMemoryLimit > 0 {
++			debug.SetMemoryLimit(sGoMemoryLimit)
++		} else if sOOMMemoryLimit > 0 {
+ 			debug.SetMemoryLimit(sOOMMemoryLimit * 3 / 4)
+ 		} else {
+ 			debug.SetMemoryLimit(math.MaxInt64)
+diff --git a/include/naive_inbound.go b/include/naive_inbound.go
+new file mode 100644
+index 0000000..b14a785
+--- /dev/null
++++ b/include/naive_inbound.go
+@@ -0,0 +1,12 @@
++//go:build !without_openvpn_openconnect_naive
++
++package include
++
++import (
++	"github.com/sagernet/sing-box/adapter/inbound"
++	"github.com/sagernet/sing-box/protocol/naive"
++)
++
++func registerNaiveInbound(registry *inbound.Registry) {
++	naive.RegisterInbound(registry)
++}
+diff --git a/protocol/tuic/outbound.go b/protocol/tuic/outbound.go
+index 694c845..a1ceb74 100644
+--- a/protocol/tuic/outbound.go
++++ b/protocol/tuic/outbound.go
+@@ -65,20 +65,22 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	quicOptions := qtls.QUICOptions{
++		IdleTimeout:             options.IdleTimeout.Build(),
++		KeepAlivePeriod:         options.KeepAlivePeriod.Build(),
++		StreamReceiveWindow:     options.StreamReceiveWindow.Value(),
++		ConnectionReceiveWindow: options.ConnectionReceiveWindow.Value(),
++		MaxConcurrentStreams:    options.MaxConcurrentStreams,
++		InitialPacketSize:       options.InitialPacketSize,
++		DisablePathMTUDiscovery: options.DisablePathMTUDiscovery,
++	}
++	applyLowMemoryQUICOptions(&quicOptions)
+ 	client, err := tuic.NewClient(tuic.ClientOptions{
+-		Context:       ctx,
+-		Dialer:        outboundDialer,
+-		ServerAddress: options.ServerOptions.Build(),
+-		TLSConfig:     tlsConfig,
+-		QUICOptions: qtls.QUICOptions{
+-			IdleTimeout:             options.IdleTimeout.Build(),
+-			KeepAlivePeriod:         options.KeepAlivePeriod.Build(),
+-			StreamReceiveWindow:     options.StreamReceiveWindow.Value(),
+-			ConnectionReceiveWindow: options.ConnectionReceiveWindow.Value(),
+-			MaxConcurrentStreams:    options.MaxConcurrentStreams,
+-			InitialPacketSize:       options.InitialPacketSize,
+-			DisablePathMTUDiscovery: options.DisablePathMTUDiscovery,
+-		},
++		Context:           ctx,
++		Dialer:            outboundDialer,
++		ServerAddress:     options.ServerOptions.Build(),
++		TLSConfig:         tlsConfig,
++		QUICOptions:       quicOptions,
+ 		UUID:              userUUID,
+ 		Password:          options.Password,
+ 		CongestionControl: options.CongestionControl,
+diff --git a/protocol/tuic/quic_low_memory.go b/protocol/tuic/quic_low_memory.go
+new file mode 100644
+index 0000000..3842af5
+--- /dev/null
++++ b/protocol/tuic/quic_low_memory.go
+@@ -0,0 +1,33 @@
++//go:build with_low_memory
++
++package tuic
++
++import (
++	"time"
++
++	qtls "github.com/sagernet/sing-quic"
++)
++
++const (
++	lowMemoryStreamReceiveWindow     = 1 << 20
++	lowMemoryConnectionReceiveWindow = 4 << 20
++	lowMemoryMaxConcurrentStreams    = 32
++	lowMemoryIdleTimeout             = 30 * time.Second
++)
++
++// applyLowMemoryQUICOptions supplies conservative defaults for memory-limited
++// Apple Network Extensions. Explicit profile values always take precedence.
++func applyLowMemoryQUICOptions(options *qtls.QUICOptions) {
++	if options.StreamReceiveWindow == 0 {
++		options.StreamReceiveWindow = lowMemoryStreamReceiveWindow
++	}
++	if options.ConnectionReceiveWindow == 0 {
++		options.ConnectionReceiveWindow = lowMemoryConnectionReceiveWindow
++	}
++	if options.MaxConcurrentStreams == 0 {
++		options.MaxConcurrentStreams = lowMemoryMaxConcurrentStreams
++	}
++	if options.IdleTimeout == 0 {
++		options.IdleTimeout = lowMemoryIdleTimeout
++	}
++}
+diff --git a/protocol/tuic/quic_low_memory_stub.go b/protocol/tuic/quic_low_memory_stub.go
+new file mode 100644
+index 0000000..076fc55
+--- /dev/null
++++ b/protocol/tuic/quic_low_memory_stub.go
+@@ -0,0 +1,7 @@
++//go:build !with_low_memory
++
++package tuic
++
++import qtls "github.com/sagernet/sing-quic"
++
++func applyLowMemoryQUICOptions(_ *qtls.QUICOptions) {}
+diff --git a/service/oomkiller/timer_darwin.go b/service/oomkiller/timer_darwin.go
+index f73ab28..144c4e3 100644
+--- a/service/oomkiller/timer_darwin.go
++++ b/service/oomkiller/timer_darwin.go
+@@ -2,14 +2,31 @@
+ 
+ package oomkiller
+ 
+-import runtimeDebug "runtime/debug"
++import (
++	runtimeDebug "runtime/debug"
++
++	"github.com/sagernet/sing/common/byteformats"
++)
+ 
+ func (t *adaptiveTimer) notifyPressure() {
+ 	runtimeDebug.FreeOSMemory()
++	sample := readMemorySample(t.policyMode)
+ 	t.access.Lock()
+ 	t.startLocked()
++	shouldTrigger := t.state != pressureStateTriggered
++	t.state = pressureStateTriggered
+ 	t.forceMinInterval = true
+ 	t.pendingPressureBaseline = true
+ 	t.access.Unlock()
++	if shouldTrigger {
++		if t.killerDisabled {
++			t.logger.Warn("memory pressure critical (report only), usage: ", byteformats.FormatMemoryBytes(sample.usage), t.logDetails(sample))
++		} else {
++			t.logger.Error("memory pressure critical, usage: ", byteformats.FormatMemoryBytes(sample.usage), t.logDetails(sample), ", resetting network immediately")
++			t.network.ResetNetwork()
++		}
++		badCleanup()
++		runtimeDebug.FreeOSMemory()
++	}
+ 	t.poll()
+ }
+diff --git a/include/naive_outbound.go b/include/naive_outbound.go
+index d15d045..9b63d79 100644
+--- a/include/naive_outbound.go
++++ b/include/naive_outbound.go
+@@ -1,4 +1,4 @@
+-//go:build with_naive_outbound
++//go:build with_naive_outbound && !without_openvpn_openconnect_naive
+ 
+ package include
+ 
+diff --git a/include/naive_outbound_stub.go b/include/naive_outbound_stub.go
+index cf89209..2aff532 100644
+--- a/include/naive_outbound_stub.go
++++ b/include/naive_outbound_stub.go
+@@ -1,4 +1,4 @@
+-//go:build !with_naive_outbound
++//go:build !with_naive_outbound && !without_openvpn_openconnect_naive
+ 
+ package include
+ 
+diff --git a/include/naive_quic.go b/include/naive_quic.go
+new file mode 100644
+index 0000000..54f497f
+--- /dev/null
++++ b/include/naive_quic.go
+@@ -0,0 +1,5 @@
++//go:build with_quic && !without_openvpn_openconnect_naive
++
++package include
++
++import _ "github.com/sagernet/sing-box/protocol/naive/quic"
+diff --git a/include/openconnect.go b/include/openconnect.go
+index 259340c..6aa18dc 100644
+--- a/include/openconnect.go
++++ b/include/openconnect.go
+@@ -1,4 +1,4 @@
+-//go:build with_openconnect
++//go:build with_openconnect && !without_openvpn_openconnect_naive
+ 
+ package include
+ 
+diff --git a/include/openconnect_stub.go b/include/openconnect_stub.go
+index 360ed8d..1915ab1 100644
+--- a/include/openconnect_stub.go
++++ b/include/openconnect_stub.go
+@@ -1,4 +1,4 @@
+-//go:build !with_openconnect
++//go:build !with_openconnect && !without_openvpn_openconnect_naive
+ 
+ package include
+ 
+diff --git a/include/openvpn.go b/include/openvpn.go
+index 58d03c7..78c64df 100644
+--- a/include/openvpn.go
++++ b/include/openvpn.go
+@@ -1,4 +1,4 @@
+-//go:build with_openvpn
++//go:build with_openvpn && !without_openvpn_openconnect_naive
+ 
+ package include
+ 
+diff --git a/include/openvpn_openconnect_naive_removed.go b/include/openvpn_openconnect_naive_removed.go
+new file mode 100644
+index 0000000..89aa603
+--- /dev/null
++++ b/include/openvpn_openconnect_naive_removed.go
+@@ -0,0 +1,22 @@
++//go:build without_openvpn_openconnect_naive
++
++package include
++
++import (
++	"github.com/sagernet/sing-box/adapter/endpoint"
++	"github.com/sagernet/sing-box/adapter/inbound"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	"github.com/sagernet/sing-box/dns"
++)
++
++func registerNaiveInbound(_ *inbound.Registry) {}
++
++func registerNaiveOutbound(_ *outbound.Registry) {}
++
++func registerOpenConnectEndpoint(_ *endpoint.Registry) {}
++
++func registerOpenConnectDNSTransport(_ *dns.TransportRegistry) {}
++
++func registerOpenVPNEndpoints(_ *endpoint.Registry) {}
++
++func registerOpenVPNDNSTransport(_ *dns.TransportRegistry) {}
+diff --git a/include/openvpn_openconnect_naive_removed_test.go b/include/openvpn_openconnect_naive_removed_test.go
+new file mode 100644
+index 0000000..011d57e
+--- /dev/null
++++ b/include/openvpn_openconnect_naive_removed_test.go
+@@ -0,0 +1,28 @@
++//go:build without_openvpn_openconnect_naive
++
++package include
++
++import (
++	"testing"
++
++	C "github.com/sagernet/sing-box/constant"
++)
++
++func TestOpenVPNOpenConnectNaiveAreNotRegistered(t *testing.T) {
++	if _, loaded := InboundRegistry().CreateOptions(C.TypeNaive); loaded {
++		t.Error("naive inbound is registered")
++	}
++	if _, loaded := OutboundRegistry().CreateOptions(C.TypeNaive); loaded {
++		t.Error("naive outbound is registered")
++	}
++	for _, endpointType := range []string{C.TypeOpenVPNClient, C.TypeOpenVPNServer, C.TypeOpenConnect} {
++		if _, loaded := EndpointRegistry().CreateOptions(endpointType); loaded {
++			t.Errorf("endpoint %q is registered", endpointType)
++		}
++	}
++	for _, dnsType := range []string{C.DNSTypeOpenVPN, C.DNSTypeOpenConnect} {
++		if _, loaded := DNSTransportRegistry().CreateOptions(dnsType); loaded {
++			t.Errorf("DNS transport %q is registered", dnsType)
++		}
++	}
++}
+diff --git a/include/openvpn_stub.go b/include/openvpn_stub.go
+index a1e24c8..6b809ac 100644
+--- a/include/openvpn_stub.go
++++ b/include/openvpn_stub.go
+@@ -1,4 +1,4 @@
+-//go:build !with_openvpn
++//go:build !with_openvpn && !without_openvpn_openconnect_naive
+ 
+ package include
+ 
+diff --git a/include/quic.go b/include/quic.go
+index 42182c2..8139f8d 100644
+--- a/include/quic.go
++++ b/include/quic.go
+@@ -10,7 +10,6 @@ import (
+ 	"github.com/sagernet/sing-box/dns/transport/quic"
+ 	"github.com/sagernet/sing-box/protocol/hysteria"
+ 	"github.com/sagernet/sing-box/protocol/hysteria2"
+-	_ "github.com/sagernet/sing-box/protocol/naive/quic"
+ 	"github.com/sagernet/sing-box/protocol/tuic"
+ 	_ "github.com/sagernet/sing-box/transport/v2rayquic"
+ )
+diff --git a/include/registry.go b/include/registry.go
+index 9bb9220..7640894 100644
+--- a/include/registry.go
++++ b/include/registry.go
+@@ -26,7 +26,6 @@ import (
+ 	"github.com/sagernet/sing-box/protocol/group"
+ 	"github.com/sagernet/sing-box/protocol/http"
+ 	"github.com/sagernet/sing-box/protocol/mixed"
+-	"github.com/sagernet/sing-box/protocol/naive"
+ 	"github.com/sagernet/sing-box/protocol/redirect"
+ 	"github.com/sagernet/sing-box/protocol/shadowsocks"
+ 	"github.com/sagernet/sing-box/protocol/shadowtls"
+@@ -36,8 +35,6 @@ import (
+ 	"github.com/sagernet/sing-box/protocol/tor"
+ 	"github.com/sagernet/sing-box/protocol/trojan"
+ 	"github.com/sagernet/sing-box/protocol/tun"
+-	"github.com/sagernet/sing-box/protocol/vless"
+-	"github.com/sagernet/sing-box/protocol/vmess"
+ 	"github.com/sagernet/sing-box/service/api"
+ 	originca "github.com/sagernet/sing-box/service/origin_ca"
+ 	"github.com/sagernet/sing-box/service/resolved"
+@@ -63,11 +60,10 @@ func InboundRegistry() *inbound.Registry {
+ 
+ 	shadowsocks.RegisterInbound(registry)
+ 	snell.RegisterInbound(registry)
+-	vmess.RegisterInbound(registry)
++	registerVMessVLESSInbounds(registry)
+ 	trojan.RegisterInbound(registry)
+-	naive.RegisterInbound(registry)
++	registerNaiveInbound(registry)
+ 	shadowtls.RegisterInbound(registry)
+-	vless.RegisterInbound(registry)
+ 	anytls.RegisterInbound(registry)
+ 
+ 	registerQUICInbounds(registry)
+@@ -92,13 +88,12 @@ func OutboundRegistry() *outbound.Registry {
+ 	http.RegisterOutbound(registry)
+ 	shadowsocks.RegisterOutbound(registry)
+ 	snell.RegisterOutbound(registry)
+-	vmess.RegisterOutbound(registry)
++	registerVMessVLESSOutbounds(registry)
+ 	trojan.RegisterOutbound(registry)
+ 	registerNaiveOutbound(registry)
+ 	tor.RegisterOutbound(registry)
+ 	ssh.RegisterOutbound(registry)
+ 	shadowtls.RegisterOutbound(registry)
+-	vless.RegisterOutbound(registry)
+ 	anytls.RegisterOutbound(registry)
+ 
+ 	registerQUICOutbounds(registry)
+diff --git a/include/vmess_vless.go b/include/vmess_vless.go
+new file mode 100644
+index 0000000..53045bb
+--- /dev/null
++++ b/include/vmess_vless.go
+@@ -0,0 +1,20 @@
++//go:build !without_vmess_vless
++
++package include
++
++import (
++	"github.com/sagernet/sing-box/adapter/inbound"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	"github.com/sagernet/sing-box/protocol/vless"
++	"github.com/sagernet/sing-box/protocol/vmess"
++)
++
++func registerVMessVLESSInbounds(registry *inbound.Registry) {
++	vmess.RegisterInbound(registry)
++	vless.RegisterInbound(registry)
++}
++
++func registerVMessVLESSOutbounds(registry *outbound.Registry) {
++	vmess.RegisterOutbound(registry)
++	vless.RegisterOutbound(registry)
++}
+diff --git a/include/vmess_vless_stub.go b/include/vmess_vless_stub.go
+new file mode 100644
+index 0000000..0a80d64
+--- /dev/null
++++ b/include/vmess_vless_stub.go
+@@ -0,0 +1,12 @@
++//go:build without_vmess_vless
++
++package include
++
++import (
++	"github.com/sagernet/sing-box/adapter/inbound"
++	"github.com/sagernet/sing-box/adapter/outbound"
++)
++
++func registerVMessVLESSInbounds(_ *inbound.Registry) {}
++
++func registerVMessVLESSOutbounds(_ *outbound.Registry) {}
+diff --git a/include/vmess_vless_stub_test.go b/include/vmess_vless_stub_test.go
+new file mode 100644
+index 0000000..b697911
+--- /dev/null
++++ b/include/vmess_vless_stub_test.go
+@@ -0,0 +1,20 @@
++//go:build without_vmess_vless
++
++package include
++
++import (
++	"testing"
++
++	C "github.com/sagernet/sing-box/constant"
++)
++
++func TestVMessVLESSAreNotRegistered(t *testing.T) {
++	for _, protocolType := range []string{C.TypeVMess, C.TypeVLESS} {
++		if _, loaded := InboundRegistry().CreateOptions(protocolType); loaded {
++			t.Errorf("inbound %q is registered", protocolType)
++		}
++		if _, loaded := OutboundRegistry().CreateOptions(protocolType); loaded {
++			t.Errorf("outbound %q is registered", protocolType)
++		}
++	}
++}

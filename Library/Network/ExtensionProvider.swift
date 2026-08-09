@@ -14,8 +14,9 @@ open class ExtensionProvider: NEPacketTunnelProvider {
 
     public private(set) var commandServer: LibboxCommandServer?
     private lazy var platformInterface = ExtensionPlatformInterface(self)
-    public var tunnelOptions: [String: NSObject]?
     private var startOptionsURL: URL?
+    private var activeConfigURL: URL?
+    private var legacyConfigContent: String?
 
     public struct OverridePreferences {
         public var includeAllNetworks: Bool = false
@@ -29,7 +30,16 @@ open class ExtensionProvider: NEPacketTunnelProvider {
 
     private func applyStartOptions(_ options: [String: NSObject]) throws {
         try ApplicationLocale.apply(options["locale"] as? String)
-        tunnelOptions = options
+        #if os(iOS)
+            let configFileName = options[ExtensionStartOptions.configPathKey] as? String ?? ExtensionStartOptions.activeConfigFileName
+            guard configFileName == ExtensionStartOptions.activeConfigFileName else {
+                throw ExtensionStartupError("(packet-tunnel) error: invalid config path")
+            }
+            activeConfigURL = FilePath.sharedDirectory.appendingPathComponent(configFileName)
+            legacyConfigContent = nil
+        #else
+            legacyConfigContent = options[ExtensionStartOptions.legacyConfigContentKey] as? String
+        #endif
         overridePreferences = OverridePreferences(
             includeAllNetworks: (options["includeAllNetworks"] as? NSNumber)?.boolValue ?? false,
             systemProxyEnabled: (options["systemProxyEnabled"] as? NSNumber)?.boolValue ?? true,
@@ -56,8 +66,12 @@ open class ExtensionProvider: NEPacketTunnelProvider {
     }
 
     private func resolveStartOptions(_ startOptions: [String: NSObject]?) throws -> [String: NSObject] {
-        if let startOptions, startOptions["configContent"] as? String != nil {
-            return startOptions
+        if let startOptions {
+            let hasConfigPath = startOptions[ExtensionStartOptions.configPathKey] as? String != nil
+            let hasLegacyConfig = startOptions[ExtensionStartOptions.legacyConfigContentKey] as? String != nil
+            if hasConfigPath || hasLegacyConfig {
+                return startOptions
+            }
         }
         let persistedOptions: [String: NSObject]?
         do {
@@ -72,6 +86,41 @@ open class ExtensionProvider: NEPacketTunnelProvider {
             return persistedOptions
         }
         throw ExtensionStartupError("(packet-tunnel) error: missing start options")
+    }
+
+    private func migrateLegacyConfigIfNeeded(_ options: [String: NSObject]) throws -> [String: NSObject] {
+        #if os(iOS)
+            var normalizedOptions = options
+            if normalizedOptions[ExtensionStartOptions.configPathKey] == nil,
+               let configContent = normalizedOptions[ExtensionStartOptions.legacyConfigContentKey] as? String
+            {
+                let configURL = FilePath.sharedDirectory.appendingPathComponent(ExtensionStartOptions.activeConfigFileName)
+                try configContent.write(to: configURL, atomically: true, encoding: .utf8)
+                normalizedOptions[ExtensionStartOptions.configPathKey] = NSString(string: ExtensionStartOptions.activeConfigFileName)
+            }
+            normalizedOptions.removeValue(forKey: ExtensionStartOptions.legacyConfigContentKey)
+            return normalizedOptions
+        #else
+            return options
+        #endif
+    }
+
+    private func loadConfigContent() throws -> String {
+        #if os(iOS)
+            guard let activeConfigURL else {
+                throw ExtensionStartupError("(packet-tunnel) error: missing config path")
+            }
+            do {
+                return try String(contentsOf: activeConfigURL, encoding: .utf8)
+            } catch {
+                throw ExtensionStartupError("(packet-tunnel) error: load config: \(error.localizedDescription)")
+            }
+        #else
+            guard let legacyConfigContent else {
+                throw ExtensionStartupError("(packet-tunnel) error: missing configContent")
+            }
+            return legacyConfigContent
+        #endif
     }
 
     #if os(macOS)
@@ -133,11 +182,8 @@ open class ExtensionProvider: NEPacketTunnelProvider {
             }
         #endif
 
-        let effectiveOptions = try resolveStartOptions(startOptions)
+        let effectiveOptions = try migrateLegacyConfigIfNeeded(resolveStartOptions(startOptions))
         try applyStartOptions(effectiveOptions)
-        if effectiveOptions["configContent"] == nil {
-            throw ExtensionStartupError("(packet-tunnel) error: missing configContent in tunnel options")
-        }
         do {
             try persistStartOptions(effectiveOptions)
         } catch {
@@ -148,7 +194,10 @@ open class ExtensionProvider: NEPacketTunnelProvider {
         options.workingPath = workingPath
         options.tempPath = tempPath
 
-        options.logMaxLines = 3000
+        // The packet-tunnel process has a strict memory budget on iOS. Keeping
+        // thousands of retained log entries can consume several MiB without
+        // helping the normal in-app log view, which defaults to 300 entries.
+        options.logMaxLines = 300
         options.debug = Variant.inDebug
         options.crashReportSource = "NetworkExtension"
 
@@ -168,6 +217,11 @@ open class ExtensionProvider: NEPacketTunnelProvider {
             options.oomKillerDisabled = !((effectiveOptions["oomKillerKillConnections"] as? NSNumber)?.boolValue ?? false)
         #else
             options.oomKillerEnabled = true
+            // Keep the Go-managed portion below the extension's total 50 MiB
+            // footprint budget, leaving headroom for gVisor, Swift, sockets,
+            // mapped code, and NetworkExtension-owned buffers.
+            options.goMemoryLimit = 32 * 1024 * 1024
+            options.goGCPercent = 75
         #endif
 
         var setupError: NSError?
@@ -226,9 +280,7 @@ open class ExtensionProvider: NEPacketTunnelProvider {
     }
 
     private func startService() async throws {
-        guard let configContent = tunnelOptions?["configContent"] as? String else {
-            throw ExtensionStartupError("(packet-tunnel) error: missing configContent in tunnel options")
-        }
+        let configContent = try loadConfigContent()
 
         let options = LibboxOverrideOptions()
         do {
@@ -307,7 +359,7 @@ open class ExtensionProvider: NEPacketTunnelProvider {
 
     override open func handleAppMessage(_ messageData: Data) async -> Data? {
         do {
-            let options = try ExtensionStartOptions.decode(messageData)
+            let options = try migrateLegacyConfigIfNeeded(ExtensionStartOptions.decode(messageData))
             try applyStartOptions(options)
             try persistStartOptions(options)
             try await reloadService()
