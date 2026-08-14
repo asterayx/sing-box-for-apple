@@ -1,5 +1,6 @@
 /.idea/
 /Libbox.xcframework/
+/config.optimized-ios.json
 xcuserdata/
 .DS_Store
 /build/
